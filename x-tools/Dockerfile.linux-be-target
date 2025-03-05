@@ -29,6 +29,7 @@ RUN apt-get update && \
     less
 
 RUN mkdir /opt/x-tools/
+ENV PATH=/opt/x-tools/armeb-linux-gnueabi/bin:$PATH
 ENV PATH=/opt/x-tools/aarch64_be-linux-gnu/bin:$PATH
 
 ################################################################################
@@ -87,14 +88,25 @@ RUN ARCH=arm64 make O=/root/linux-4.12/build/ olddefconfig
 WORKDIR /root/linux-4.12/build/
 RUN ARCH=arm64 CROSS_COMPILE=aarch64_be-linux-gnu- \
     CFLAGS="-march=armv8-a -mbig-endian" LDFLAGS="-EB"\
-    make -j8 Image.gz
+    make -j8 Image.gz \
+    KCFLAGS="\
+      -Wno-attribute-alias \
+      -Wno-sizeof-pointer-memaccess \
+      -Wno-format-overflow \
+      -Wno-format-truncation \
+      -Wno-address-of-packed-member \
+      -Wno-packed-not-aligned \
+      -Wno-int-in-bool-context \
+      -Wno-stringop-overflow \
+      -Wno-stringop-truncation \
+      -Wno-maybe-uninitialized \
+      "
 
 ################################################################################
 # BUSYBOX                                                                      #
 ################################################################################
 FROM platform AS busybox
 COPY --from=x-tools-linux-armbe8 /opt/x-tools/ /opt/x-tools/
-ENV PATH=/opt/x-tools/armeb-linux-gnueabi/bin:$PATH
 WORKDIR /root/
 RUN git clone -b 1_35_0 https://github.com/mirror/busybox.git
 WORKDIR /root/busybox
@@ -104,6 +116,168 @@ RUN make O=/root/busybox/build CROSS_COMPILE=armeb-linux-gnueabi- \
 RUN echo "CONFIG_STATIC=y" >> /root/busybox/build/.config
 RUN make O=/root/busybox/build CROSS_COMPILE=armeb-linux-gnueabi- \
     CFLAGS="-march=armv8-a" LDFLAGS="-mbe8" -j8 install
+
+################################################################################
+# GMP                                                                          #
+################################################################################
+FROM base AS gmp
+WORKDIR /root/
+RUN wget http://ftpmirror.gnu.org/gmp/gmp-6.2.0.tar.bz2
+RUN tar xf gmp-6.2.0.tar.bz2
+
+################################################################################
+# EXPAT                                                                        #
+################################################################################
+FROM base AS expat
+WORKDIR /root/
+RUN wget https://github.com/libexpat/libexpat/releases/download/R_2_2_6/expat-2.2.6.tar.bz2
+RUN tar xf expat-2.2.6.tar.bz2
+
+################################################################################
+# MPFR                                                                         #
+################################################################################
+FROM base AS mpfr
+WORKDIR /root/
+RUN wget http://ftpmirror.gnu.org/mpfr/mpfr-4.0.2.tar.bz2
+RUN tar xf mpfr-4.0.2.tar.bz2
+
+################################################################################
+# GDB                                                                          #
+################################################################################
+FROM base AS gdb
+WORKDIR /root/
+RUN wget http://ftpmirror.gnu.org/gnu/gdb/gdb-8.2.tar.gz
+RUN tar xf gdb-8.2.tar.gz
+
+################################################################################
+# GMP-32                                                                       #
+################################################################################
+FROM platform AS gmp-32
+COPY --from=x-tools-linux-armbe8 /opt/x-tools/ /opt/x-tools/
+COPY --from=gmp /root/gmp-6.2.0 /root/gmp-6.2.0
+RUN mkdir /root/build-gmp/
+WORKDIR /root/build-gmp/
+RUN LDFLAGS=" \
+    -static-libstdc++ \
+    " \
+    /root/gmp-6.2.0/configure \
+    --prefix=/root/install-gmp/ \
+    --host=armeb-linux-gnueabi \
+    --disable-shared \
+    --enable-static
+RUN make -j
+RUN make install
+
+################################################################################
+# EXPAT-32                                                                     #
+################################################################################
+FROM platform AS expat-32
+COPY --from=x-tools-linux-armbe8 /opt/x-tools/ /opt/x-tools/
+COPY --from=expat /root/expat-2.2.6 /root/expat-2.2.6
+RUN mkdir /root/build-expat/
+WORKDIR /root/build-expat/
+RUN LDFLAGS=" \
+    -static-libstdc++ \
+    " \
+    /root/expat-2.2.6/configure \
+    --prefix=/root/install-expat/ \
+    --host=armeb-linux-gnueabi \
+    --disable-shared \
+    --enable-static
+RUN make -j
+RUN make install
+
+################################################################################
+# MPFR-32                                                                       #
+################################################################################
+FROM platform AS mpfr-32
+COPY --from=x-tools-linux-armbe8 /opt/x-tools/ /opt/x-tools/
+COPY --from=mpfr /root/mpfr-4.0.2 /root/mpfr-4.0.2
+COPY --from=gmp-32 /root/install-gmp /root/install-gmp
+RUN mkdir /root/build-mpfr/
+WORKDIR /root/build-mpfr/
+RUN LDFLAGS=" \
+    -static-libstdc++ \
+    " \
+    /root/mpfr-4.0.2/configure \
+    --prefix=/root/install-mpfr/ \
+    --host=armeb-linux-gnueabi \
+    --with-gmp=/root/install-gmp \
+    --disable-shared \
+    --enable-static
+RUN make -j
+RUN make install
+
+################################################################################
+# GDB-32                                                                       #
+################################################################################
+FROM platform AS gdb-32
+COPY --from=gdb /root/gdb-8.2 /root/gdb-8.2
+COPY --from=x-tools-linux-armbe8 /opt/x-tools/ /opt/x-tools/
+COPY --from=x-tools-linux-arm64be /opt/x-tools/ /opt/x-tools/
+COPY --from=gmp-32 /root/install-gmp /root/install-gmp
+COPY --from=mpfr-32 /root/install-mpfr /root/install-mpfr
+COPY --from=expat-32 /root/install-expat /root/install-expat
+RUN mkdir /root/build-gdb/
+WORKDIR /root/build-gdb/
+RUN CFLAGS="-DPATH_MAX=4096" \
+    CXXFLAGS="-DPATH_MAX=4096" \
+    LDFLAGS="-mbe8" \
+    /root/gdb-8.2/configure \
+    --prefix=/root/install-gdb \
+    --host=armeb-linux-gnueabi \
+    --with-static-standard-libraries \
+    --disable-source-highlight \
+    --with-gmp=/root/install-gmp \
+    --with-gmp-type=static \
+    --with-mpfr=/root/install-mpfr \
+    --with-mpfr-type=static \
+    --with-expat=/root/install-expat \
+    --with-expat-type=static \
+    --disable-tui
+RUN make -j
+RUN make install
+
+################################################################################
+# LLDB-SERVER                                                                  #
+################################################################################
+FROM platform AS lldb-server
+COPY --from=x-tools-linux-armbe8 /opt/x-tools/ /opt/x-tools/
+RUN apt-get update && \
+    apt-get install -y \
+    cmake \
+    ninja-build \
+    python3 \
+    clang
+WORKDIR /root/
+RUN git clone \
+    --depth=1 \
+    --branch llvmorg-14.0.6 \
+    https://github.com/llvm/llvm-project.git
+WORKDIR /root/llvm-project/
+ENV CC=armeb-linux-gnueabi-gcc
+ENV CXX=armeb-linux-gnueabi-g++
+ENV TARGET=armeb-linux-gnueabi
+RUN mkdir /root/llvm-build
+WORKDIR /root/llvm-build
+RUN cmake \
+    -G "Ninja" \
+    -S /root/llvm-project/llvm \
+    -B /root/llvm-build \
+    -DCMAKE_C_COMPILER=$CC \
+    -DCMAKE_CXX_COMPILER=$CXX \
+    -DLLDB_TEST_COMPILER=$CC \
+    -DLLDB_USE_SYSTEM_DEBUGSERVER=OFF \
+    -DLLDB_ENABLE_LIBEDIT=OFF \
+    -DLLDB_ENABLE_CURSES=OFF \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLVM_BUILD_DOCS=OFF \
+    -DLLVM_INSTALL_UTILS=ON \
+    -DCMAKE_INSTALL_PREFIX=/root/install-lldb \
+    -DCMAKE_CROSSCOMPILING=True \
+    -DLLVM_TARGETS_TO_BUILD="AArch64;ARM" \    
+    -DLLVM_ENABLE_PROJECTS="clang;lldb" \
+    -DLLVM_DEFAULT_TARGET_TRIPLE=armeb-linux-gnueabi
 
 ################################################################################
 # INITRD                                                                       #
@@ -176,7 +350,7 @@ int main(int argc, char **argv)
     return EXIT_SUCCESS;
 }
 EOF
-RUN /opt/x-tools/armeb-linux-gnueabi/bin/armeb-linux-gnueabi-gcc \
+RUN armeb-linux-gnueabi-gcc \
     -march=armv8-a \
     -mbe8 \
     -o /root/initramfs/sbin/entropy \
@@ -213,6 +387,7 @@ COPY --from=x-tools-linux-armbe8 /opt/x-tools/armeb-linux-gnueabi/armeb-linux-gn
 COPY --from=x-tools-linux-arm64be /opt/x-tools/aarch64_be-linux-gnu/aarch64_be-linux-gnu/sysroot/usr/lib /root/initramfs/lib64/
 COPY --from=x-tools-linux-arm64beilp32 /opt/x-tools/aarch64_be_ilp32-linux-gnu/aarch64_be-linux-gnu/sysroot/usr/lib/ /root/initramfs/libilp32/
 COPY --from=x-tools-linux-armbe8 /opt/x-tools/armeb-linux-gnueabi/armeb-linux-gnueabi/sysroot/usr/sbin/ldconfig /root/initramfs/sbin
+COPY --from=gdb-32 /root/install-gdb/bin/gdbserver /root/initramfs/sbin/gdbserver
 RUN cat <<EOF > /root/initramfs/etc/group
 root:x:0:
 EOF
@@ -238,6 +413,7 @@ ip link set eth0 up
 ip route add default via 192.168.76.2 dev eth0
 export LD_LIBRARY_PATH=/lib:/lib64:/libilp32
 /sbin/entropy
+gdbserver --multi 192.168.76.20:2159 &>/dev/null &
 cat /etc/motd
 export PS1='\u@frida:\w\$ '
 exec setsid sh -c 'exec sh </dev/ttyAMA0 >/dev/ttyAMA0 2>&1'
