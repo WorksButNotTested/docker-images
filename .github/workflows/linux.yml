@@ -43,6 +43,6 @@ jobs:
         with:
           context: x-tools
           file: x-tools/Dockerfile.linux-${{ matrix.flavor }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: dev-${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
